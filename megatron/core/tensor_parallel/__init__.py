@@ -3,6 +3,8 @@ from .data import broadcast_data
 from .layers import (
     ColumnParallelLinear,
     RowParallelLinear,
+    RowParallelLinearNoComm,
+    ColRowParallelLinear,
     VocabParallelEmbedding,
     copy_tensor_model_parallel_attributes,
     linear_with_grad_accumulation_and_async_allreduce,

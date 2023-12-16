@@ -498,13 +498,23 @@ class TransformerLanguageModel(MegatronModule):
         # Run encoder.
         if enc_hidden_states is None:
             if self.encoder is not None:
-                encoder_output = self.encoder(
-                    encoder_input,
+                encoder_out_size = encoder_input.shape
+                p_batch_size = encoder_out_size[1] // 2
+                dtype = encoder_input.dtype
+                # encoder_output_t = torch.zeros(encoder_out_size, dtype=dtype, device=torch.cuda.current_device())
+                encoder_output_t = torch.empty(encoder_out_size, dtype=dtype, device=torch.cuda.current_device())
+                intra_partitions = 2
+                encoder_inputs = torch.tensor_split(encoder_input, intra_partitions, dim=1)
+                encoder_outputs = self.encoder(
+                    encoder_inputs,
                     enc_attn_mask,
                     retriever_input=retriever_input,
                     retriever_attn_mask=retriever_attn_mask,
                     inference_params=inference_params,
                     rotary_pos_emb=rotary_pos_emb)
+                encoder_output_t[:, 0:p_batch_size, :] = encoder_outputs[0]
+                encoder_output_t[:, p_batch_size:2*p_batch_size, :] = encoder_outputs[1]
+                encoder_output = encoder_output_t
             else:
                 encoder_output = self.encoder_hidden_state
         else:
