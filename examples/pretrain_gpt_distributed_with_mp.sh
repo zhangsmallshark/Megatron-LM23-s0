@@ -4,6 +4,7 @@
 
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export TORCH_EXTENSIONS_DIR=/home/czh5/.cache/polaris_torch_extensions
+export CUDA_LAUNCH_BLOCKING=1
 
 GPUS_PER_NODE=4
 # Change for multinode config
@@ -37,7 +38,7 @@ GPT_ARGS="
     --micro-batch-size 8 \
     --global-batch-size 8 \
     --lr 0.00015 \
-    --train-iters 10 \
+    --train-iters 200 \
     --lr-decay-iters 320000 \
     --lr-decay-style cosine \
     --min-lr 1.0e-5 \

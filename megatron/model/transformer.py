@@ -1149,9 +1149,10 @@ class ParallelTransformerLayer(MegatronModule):
                 attention_mask,
                 inference_params=inference_params,
                 rotary_pos_emb=rotary_pos_emb)
-        handle0 = torch.distributed.all_reduce(attention_output0, group=mpu.get_tensor_model_parallel_group())
-        # handle0 = torch.distributed.all_reduce(attention_output0, group=mpu.get_tensor_model_parallel_group(), async_op=True)
+        # handle0 = torch.distributed.all_reduce(attention_output0, group=mpu.get_tensor_model_parallel_group())
+        handle0 = torch.distributed.all_reduce(attention_output0, group=mpu.get_tensor_model_parallel_group(), async_op=True)
 
+        # event0 = torch.cuda.Event()
         # stream1 = get_stream(1)
         # with torch.cuda.stream(stream1):
         attention_output1, attention_bias = \
@@ -1161,7 +1162,8 @@ class ParallelTransformerLayer(MegatronModule):
                 inference_params=inference_params,
                 rotary_pos_emb=rotary_pos_emb)
         torch.distributed.all_reduce(attention_output1, group=mpu.get_tensor_model_parallel_group()) 
-        # handle0.wait()
+        handle0.wait()
+        # event0.wait(stream1)
 
         # Residual connection.
         if self.apply_residual_connection_post_layernorm:
