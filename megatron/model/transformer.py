@@ -6,6 +6,7 @@ import math
 import numpy as np
 import torch
 import torch.nn.functional as F
+from torch.nn.parameter import Parameter
 from typing import Optional
 
 from megatron import get_timers, get_args, get_retro_args, core, get_num_microbatches, get_stream
@@ -18,6 +19,8 @@ from megatron.model.fused_softmax import FusedScaleMaskSoftmax
 from megatron.model.fused_bias_gelu import bias_gelu_impl
 from megatron.core.models.common.rotary_pos_embedding import apply_rotary_pos_emb
 from megatron.model.utils import attention_mask_func, openai_gelu, erf_gelu
+
+from megatron.core.tensor_parallel.layers import _initialize_affine_weight_gpu, set_tensor_model_parallel_attributes
 
 try:
     from einops import rearrange
@@ -889,10 +892,202 @@ class ParallelTransformerLayer(MegatronModule):
                 apply_layernorm_1p=args.apply_layernorm_1p)
 
         # MLP
-        if args.num_experts is not None:
-            self.mlp = SwitchMLP(config)
+        # if args.num_experts is not None:
+        #     self.mlp = SwitchMLP(config)
+        # else:
+        #     self.mlp = ParallelMLP1(config)
+
+        # ------------ explicit mlp start ------------
+        ffn_hidden_size = config.ffn_hidden_size
+        if config.gated_linear_unit:
+            ffn_hidden_size *= 2
+    
+        input_size = config.hidden_size
+        output_size = ffn_hidden_size
+        init_method=config.init_method
+        bias=config.add_bias_linear
+        gather_output=False
+        stride=1
+        keep_master_weight_for_test=False
+        skip_bias_add=True
+        skip_weight_param_allocation = False
+        is_expert=False
+
+        # Keep input parameters
+        self.input_size = input_size
+        self.output_size = output_size
+        self.gather_output = gather_output
+        # Divide the weight matrix along the last dimension.
+        world_size = mpu.get_tensor_model_parallel_world_size()
+        self.output_size_per_partition = core.utils.divide(output_size, world_size)
+        self.skip_bias_add = skip_bias_add
+        self.is_expert = is_expert
+        # self.expert_parallel = config.expert_model_parallel_size > 1
+        self.expert_parallel = False
+        self.config = config
+
+        # Keep input parameters
+        self.input_size_r = output_size
+        self.output_size_r = input_size
+        # self.input_is_parallel = input_is_parallel
+        self.input_is_parallel = False
+
+        # Divide the weight matrix along the last dimension.
+        self.input_size_per_partition = core.utils.divide(self.input_size_r, world_size)
+
+        self.gradient_accumulation_fusion = config.gradient_accumulation_fusion
+        self.sequence_parallel = config.sequence_parallel
+        if self.sequence_parallel and not self.input_is_parallel:
+            raise RuntimeError("To enable `sequence_parallel`, `input_is_parallel` must be `True`")
+
+        # Parameters.
+        # Note: torch.nn.functional.linear performs XA^T + b and as a result
+        # we allocate the transpose.
+        # Initialize weight.
+        if not skip_weight_param_allocation:
+            if config.use_cpu_initialization:
+                self.weight_c = Parameter(
+                    torch.empty(
+                        self.output_size_per_partition, self.input_size, dtype=config.params_dtype
+                    )
+                )
+
+                self.weight_r = Parameter(
+                    torch.empty(
+                        self.output_size_r, self.input_size_per_partition, dtype=config.params_dtype
+                    )
+                )
+
+                if config.perform_initialization:
+                    self.master_weight = _initialize_affine_weight_cpu(
+                        self.weight_c,
+                        self.output_size,
+                        self.input_size,
+                        self.output_size_per_partition,
+                        0,
+                        init_method,
+                        stride=stride,
+                        return_master_weight=keep_master_weight_for_test,
+                    )
+
+                    self.master_weight_r = _initialize_affine_weight_cpu(
+                        self.weight_r,
+                        self.output_size_r,
+                        self.input_size_r,
+                        self.input_size_per_partition,
+                        1,
+                        init_method,
+                        stride=stride,
+                        return_master_weight=keep_master_weight_for_test,
+                        params_dtype=config.params_dtype,
+                    )
+            else:
+                self.weight_c = Parameter(
+                    torch.empty(
+                        self.output_size_per_partition,
+                        self.input_size,
+                        device=torch.cuda.current_device(),
+                        dtype=config.params_dtype,
+                    )
+                )
+
+                self.weight_r = Parameter(
+                    torch.empty(
+                        self.output_size_r,
+                        self.input_size_per_partition,
+                        device=torch.cuda.current_device(),
+                        dtype=config.params_dtype,
+                    )
+                )
+
+                if config.perform_initialization:
+                    _initialize_affine_weight_gpu(
+                        self.weight_c,
+                        init_method,
+                        partition_dim=0,
+                        stride=stride,
+                        # expert_parallel=(self.is_expert and self.expert_parallel),
+                    )
+
+                    _initialize_affine_weight_gpu(
+                        self.weight_r,
+                        init_method,
+                        partition_dim=1,
+                        stride=stride,
+                        # expert_parallel=(self.is_expert and self.expert_parallel),
+                    )
+            setattr(self.weight_c, 'allreduce', not (self.is_expert and self.expert_parallel))
+            setattr(self.weight_r, 'allreduce', not (self.is_expert and self.expert_parallel))
         else:
-            self.mlp = ParallelMLP1(config)
+            self.weight_c = None
+
+        if bias:
+            if config.use_cpu_initialization:
+                self.bias_c = Parameter(
+                    torch.empty(self.output_size_per_partition, dtype=config.params_dtype)
+                )
+                self.bias_r = Parameter(
+                    torch.empty(self.output_size_r, dtype=config.params_dtype)
+                )
+            else:
+                self.bias_c = Parameter(
+                    torch.empty(
+                        self.output_size_per_partition,
+                        device=torch.cuda.current_device(),
+                        dtype=config.params_dtype,
+                    )
+                )
+                self.bias_r = Parameter(
+                    torch.empty(
+                        self.output_size_r,
+                        device=torch.cuda.current_device(),
+                        dtype=config.params_dtype,
+                    )
+                )
+            set_tensor_model_parallel_attributes(self.bias_c, True, 0, stride)
+            set_tensor_model_parallel_attributes(self.bias_r, True, 0, stride)
+            if config.perform_initialization:
+                # Always initialize bias to zero.
+                with torch.no_grad():
+                    self.bias_c.zero_()
+                    self.bias_r.zero_()
+        else:
+            self.register_parameter('bias', None)
+
+        self.async_tensor_model_parallel_allreduce = (
+            config.async_tensor_model_parallel_allreduce and world_size > 1
+        )
+
+        self.sequence_parallel = config.sequence_parallel
+        if self.sequence_parallel and world_size <= 1:
+            warnings.warn(
+                f"`sequence_parallel` is set to `True`, but tensor model parallel size is {world_size}. "
+                f"Disabling sequence parallel."
+            )
+            self.sequence_parallel = False
+
+        # if config.gradient_accumulation_fusion and not _grad_accum_fusion_available:
+        #     raise RuntimeError(
+        #         "ColumnParallelLinear was called with gradient_accumulation_fusion set "
+        #         "to True but the custom CUDA extension fused_weight_gradient_mlp_cuda "
+        #         "module is not found. To use gradient_accumulation_fusion you must "
+        #         "install APEX with --cpp_ext and --cuda_ext. For example: "
+        #         "pip install --global-option=\"--cpp_ext\" --global-option=\"--cuda_ext .\" "
+        #         "Note that the extension requires CUDA>=11. Otherwise, you must turn off "
+        #         "gradient accumulation fusion."
+        #     )
+        self.gradient_accumulation_fusion = config.gradient_accumulation_fusion
+
+        if self.async_tensor_model_parallel_allreduce and self.sequence_parallel:
+            raise RuntimeError(
+                "`async_tensor_model_parallel_allreduce` and `sequence_parallel` "
+                "cannot be enabled at the same time."
+            )
+
+        self.explicit_expert_comm = self.is_expert and (
+            self.sequence_parallel or self.expert_parallel
+        )
+        # ------------ explicit mlp end ------------
 
         # Set bias+dropout+add fusion grad_enable execution handler.
         TORCH_MAJOR = int(torch.__version__.split('.')[0])
@@ -1161,17 +1356,15 @@ class ParallelTransformerLayer(MegatronModule):
                 attention_mask,
                 inference_params=inference_params,
                 rotary_pos_emb=rotary_pos_emb)
-        torch.distributed.all_reduce(attention_output1, group=mpu.get_tensor_model_parallel_group()) 
+        handle1 = torch.distributed.all_reduce(attention_output1, group=mpu.get_tensor_model_parallel_group(), async_op=True)
         handle0.wait()
         # event0.wait(stream1)
 
-        # Residual connection.
+        # Residual0 connection.
         if self.apply_residual_connection_post_layernorm:
             residual0 = layernorm_output0
-            residual1 = layernorm_output1
         else:
             residual0 = hidden_states0
-            residual1 = hidden_states1
 
         if self.drop_path is None:
             # jit scripting for a nn.module (with dropout) is not
@@ -1185,34 +1378,73 @@ class ParallelTransformerLayer(MegatronModule):
                     bias_dropout_add_func = bias_dropout_add_fused_inference
             else:
                 bias_dropout_add_func = get_bias_dropout_add(self.training)
-
-            attention_bias0, attention_bias1 = None, None
+            
+            attention_bias0 = None
             if attention_bias is not None:
                 attention_bias0 = attention_bias.expand_as(residual0)
-                attention_bias1 = attention_bias.expand_as(residual1)
             with self.bias_dropout_add_exec_handler():
                 layernorm_input0 = bias_dropout_add_func(
                     attention_output0,
                     attention_bias0,
                     residual0,
                     self.hidden_dropout)
-                layernorm_input1 = bias_dropout_add_func(
-                    attention_output1,
-                    attention_bias1,
-                    residual1,
-                    self.hidden_dropout)
         else:
-            out0 = torch.nn.functional.dropout(attention_output0 + attention_bias0,
+            out0 = torch.nn.functional.dropout(attention_output0 + attention_bias,
                                               p=self.hidden_dropout,
                                               training=self.training)
             layernorm_input0 = residual0 + self.drop_path(out0)
-            out1 = torch.nn.functional.dropout(attention_output1 + attention_bias1,
-                                              p=self.hidden_dropout,
-                                              training=self.training)
-            layernorm_input1 = residual1 + self.drop_path(out0)
+
         # Layer norm post the self attention.
         layernorm_output0 = self.post_attention_layernorm(layernorm_input0)
-        layernorm_output1 = self.post_attention_layernorm(layernorm_input1)
+
+        # # Residual connection.
+        # if self.apply_residual_connection_post_layernorm:
+        #     residual0 = layernorm_output0
+        #     residual1 = layernorm_output1
+        # else:
+        #     residual0 = hidden_states0
+        #     residual1 = hidden_states1
+
+        # if self.drop_path is None:
+        #     # jit scripting for a nn.module (with dropout) is not
+        #     # trigerring the fusion kernel. For now, we use two
+        #     # different nn.functional routines to account for varying
+        #     # dropout semantics during training and inference phases.
+        #     if self.bias_dropout_fusion:
+        #         if self.training:
+        #             bias_dropout_add_func = bias_dropout_add_fused_train
+        #         else:
+        #             bias_dropout_add_func = bias_dropout_add_fused_inference
+        #     else:
+        #         bias_dropout_add_func = get_bias_dropout_add(self.training)
+
+        #     attention_bias0, attention_bias1 = None, None
+        #     if attention_bias is not None:
+        #         attention_bias0 = attention_bias.expand_as(residual0)
+        #         attention_bias1 = attention_bias.expand_as(residual1)
+        #     with self.bias_dropout_add_exec_handler():
+        #         layernorm_input0 = bias_dropout_add_func(
+        #             attention_output0,
+        #             attention_bias0,
+        #             residual0,
+        #             self.hidden_dropout)
+        #         layernorm_input1 = bias_dropout_add_func(
+        #             attention_output1,
+        #             attention_bias1,
+        #             residual1,
+        #             self.hidden_dropout)
+        # else:
+        #     out0 = torch.nn.functional.dropout(attention_output0 + attention_bias0,
+        #                                       p=self.hidden_dropout,
+        #                                       training=self.training)
+        #     layernorm_input0 = residual0 + self.drop_path(out0)
+        #     out1 = torch.nn.functional.dropout(attention_output1 + attention_bias1,
+        #                                       p=self.hidden_dropout,
+        #                                       training=self.training)
+        #     layernorm_input1 = residual1 + self.drop_path(out0)
+        # # Layer norm post the self attention.
+        # layernorm_output0 = self.post_attention_layernorm(layernorm_input0)
+        # layernorm_output1 = self.post_attention_layernorm(layernorm_input1)
 
         # # Cross attention.
         # if self.layer_type == LayerType.encoder:
@@ -1248,7 +1480,106 @@ class ParallelTransformerLayer(MegatronModule):
         #                     self.layer_type.name)
 
         # MLP.
-        mlp_output0, mlp_output1, mlp_bias = self.mlp([layernorm_output0, layernorm_output1])
+        # mlp_output0, mlp_output1, mlp_bias = self.mlp([layernorm_output0, layernorm_output1])
+
+        # ------------ explicit mlp start ------------
+        weight = None
+        if weight is None:
+            if self.weight_c is None:
+                raise RuntimeError(
+                    "weight was not supplied to ColumnParallelLinear forward pass "
+                    "and skip_weight_param_allocation is True."
+                )
+            weight = self.weight_c
+        else:
+            # Check the weight passed in is the correct shape
+            expected_shape = (self.output_size_per_partition, self.input_size)
+            if weight.shape != expected_shape:
+                raise RuntimeError(
+                    f"supplied weight's shape is {tuple(weight.shape)}, "
+                    f"not {expected_shape} as expected"
+                )
+
+        bias_c = self.bias_c if not self.skip_bias_add else None
+
+        if self.async_tensor_model_parallel_allreduce or self.sequence_parallel:
+            input0 = layernorm_output0
+        else:
+            input0 = copy_to_tensor_model_parallel_region(layernorm_output0)
+
+        # Batch0 Matrix multiply.
+        output0 = torch.matmul(input0, self.weight_c.t())
+        if bias_c is not None:
+            output0 = output0 + bias_c
+        output0 = F.gelu(output0)
+        output0 = torch.matmul(output0, self.weight_r.t())
+        handle2 = torch.distributed.all_reduce(output0, group=mpu.get_tensor_model_parallel_group(), async_op=True)
+
+
+        handle1.wait()
+        # Residual1 connection.
+        if self.apply_residual_connection_post_layernorm:
+            residual1 = layernorm_output1
+        else:
+            residual1 = hidden_states1
+
+        if self.drop_path is None:
+            # jit scripting for a nn.module (with dropout) is not
+            # trigerring the fusion kernel. For now, we use two
+            # different nn.functional routines to account for varying
+            # dropout semantics during training and inference phases.
+            if self.bias_dropout_fusion:
+                if self.training:
+                    bias_dropout_add_func = bias_dropout_add_fused_train
+                else:
+                    bias_dropout_add_func = bias_dropout_add_fused_inference
+            else:
+                bias_dropout_add_func = get_bias_dropout_add(self.training)
+
+            attention_bias1 = None
+            if attention_bias is not None:
+                attention_bias1 = attention_bias.expand_as(residual1)
+            with self.bias_dropout_add_exec_handler():
+                layernorm_input1 = bias_dropout_add_func(
+                    attention_output1,
+                    attention_bias1,
+                    residual1,
+                    self.hidden_dropout)
+        else:
+            out1 = torch.nn.functional.dropout(attention_output1 + attention_bias,
+                                              p=self.hidden_dropout,
+                                              training=self.training)
+            layernorm_input1 = residual1 + self.drop_path(out1)
+
+        # Layer norm post the self attention.
+        layernorm_output1 = self.post_attention_layernorm(layernorm_input1)
+
+        # Batch1 Matrix multiply.
+        if self.async_tensor_model_parallel_allreduce or self.sequence_parallel:
+            input1 = layernorm_output1
+        else:
+            input1 = copy_to_tensor_model_parallel_region(layernorm_output1)
+
+        stream1 = get_stream(1)
+        with torch.cuda.stream(stream1):
+            output1 = torch.matmul(input1, self.weight_c.t())
+            output1 = F.gelu(output1)
+            if bias_c is not None:
+                output1 = output1 + bias_c
+            output1 = torch.matmul(output1, self.weight_r.t())
+            torch.distributed.all_reduce(output1, group=mpu.get_tensor_model_parallel_group()) 
+
+        handle2.wait()
+
+        if not self.skip_bias_add:
+            output0 = output0 + self.bias_r if self.bias_r is not None else output0
+            output1 = output1 + self.bias_r if self.bias_r is not None else output1
+            output_bias = None
+        else:
+            output_bias = self.bias_r
+
+        mlp_output0, mlp_output1, mlp_bias = output0, output1, output_bias
+        # ------------ explicit mlp end ------------
 
         # Second residual connection.
         if self.apply_residual_connection_post_layernorm:

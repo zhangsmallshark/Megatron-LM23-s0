@@ -721,15 +721,15 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         # output = prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=10)
         # print(output)
         if is_rank_0():
-            prof.export_chrome_trace(f"./traces/s_0.json")
+            prof.export_chrome_trace(f"./traces/s_2.json")
 
-    # with profile(
-    #     activities=[ProfilerActivity.CUDA],
-    #     record_shapes=True,
-    #     schedule=torch.profiler.schedule(wait=2, warmup=2, active=3),
-    #     on_trace_ready=trace_handler 
-    # ) as prof:
-    if True:
+    with profile(
+        activities=[ProfilerActivity.CUDA],
+        record_shapes=True,
+        schedule=torch.profiler.schedule(wait=2, warmup=2, active=3),
+        on_trace_ready=trace_handler 
+    ) as prof:
+    # if True:
         while iteration < args.train_iters:
             if args.profile and \
             iteration == args.profile_step_start and \
@@ -747,7 +747,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                         opt_param_scheduler,
                         config)
             iteration += 1
-            # prof.step()
+            prof.step()
             args.consumed_train_samples += mpu.get_data_parallel_world_size() * \
                                         args.micro_batch_size * \
                                         get_num_microbatches()

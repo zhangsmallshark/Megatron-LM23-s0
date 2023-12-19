@@ -1,10 +1,8 @@
 #!/bin/bash --login
 
-# Runs the "345M" parameter model
-
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export TORCH_EXTENSIONS_DIR=/home/czh5/.cache/polaris_torch_extensions
-export CUDA_LAUNCH_BLOCKING=1
+# export CUDA_LAUNCH_BLOCKING=1
 
 GPUS_PER_NODE=4
 # Change for multinode config
@@ -28,17 +26,39 @@ DISTRIBUTED_ARGS="
     --master_port $MASTER_PORT
 "
 
+# Runs the "345M" parameter model
+# GPT_ARGS="
+#     --tensor-model-parallel-size $WORLD_SIZE \
+#     --num-layers 24 \
+#     --hidden-size 1024 \
+#     --num-attention-heads 16 \
+#     --seq-length 1024 \
+#     --max-position-embeddings 1024 \
+#     --micro-batch-size 8 \
+#     --global-batch-size 8 \
+#     --lr 0.00015 \
+#     --train-iters 200 \
+#     --lr-decay-iters 320000 \
+#     --lr-decay-style cosine \
+#     --min-lr 1.0e-5 \
+#     --weight-decay 1e-2 \
+#     --lr-warmup-fraction .01 \
+#     --clip-grad 1.0 \
+#     --fp16
+# "
+
+# Runs the "1.3B" parameter model
 GPT_ARGS="
     --tensor-model-parallel-size $WORLD_SIZE \
-    --num-layers 24 \
-    --hidden-size 1024 \
-    --num-attention-heads 16 \
+    --num-layers 20 \
+    --hidden-size 2048 \
+    --num-attention-heads 32 \
     --seq-length 1024 \
     --max-position-embeddings 1024 \
-    --micro-batch-size 8 \
-    --global-batch-size 8 \
+    --micro-batch-size 16 \
+    --global-batch-size 16 \
     --lr 0.00015 \
-    --train-iters 200 \
+    --train-iters 10 \
     --lr-decay-iters 320000 \
     --lr-decay-style cosine \
     --min-lr 1.0e-5 \
